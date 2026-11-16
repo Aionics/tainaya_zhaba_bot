@@ -607,6 +607,9 @@ async def cb_join(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(Form.name)
     await ask_below(
         call,
+        f"🎄 <b>{GAME_NAME}</b>\n"
+        f"💰 Бюджет подарка: <b>{budget_text()}</b>\n"
+        f"📅 Обмен подарками: <b>{event_text()}</b>\n\n"
         "📝 <b>Анкета участника</b> (1/4)\n\n"
         "👤 <b>Как тебя зовут?</b>\n"
         "<i>Это имя увидит твой Тайный Санта.</i>",
