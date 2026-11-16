@@ -397,6 +397,24 @@ def draw_text(r: sqlite3.Row) -> str:
     )
 
 
+def participants_list_text(with_usernames: bool) -> str:
+    """Список участников: только имена и ✈️ — без пожеланий и адресов.
+    @username показываем только организатору."""
+    people = all_participants()
+    if not people:
+        return "Пока никто не записался 🐸"
+    lines = [
+        f"{i}. {escape(p['name'])}"
+        + (f" (@{escape(p['username'])})" if with_usernames and p["username"] else "")
+        + (" ✈️" if p["location"] == LOC_AWAY else "")
+        for i, p in enumerate(people, 1)
+    ]
+    text = f"👥 <b>Участники ({len(people)}):</b>\n\n" + "\n".join(lines)
+    if any(p["location"] == LOC_AWAY for p in people):
+        text += "\n\n✈️ — не будет на празднике" + (", нужна доставка" if with_usernames else "")
+    return text
+
+
 # ───────────────────────── Клавиатуры ─────────────────────────
 
 def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -422,6 +440,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         rows.append([("🚪 Выйти из игры", "leave")])
     else:
         rows.append([("🐸 Участвую!", "join")])
+    rows.append([("👥 Список участников", "people")])
     rows.append([("📜 Правила", "rules")])
     if user_id in ADMIN_IDS:
         rows.append([("👑 Панель организатора", "admin")])
@@ -579,6 +598,12 @@ async def cb_menu(call: CallbackQuery, state: FSMContext) -> None:
 
 
 
+@router.callback_query(F.data == "people")
+async def cb_people(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text(participants_list_text(with_usernames=False), reply_markup=BACK_KB)
+
+
 @router.callback_query(F.data == "rules")
 async def cb_rules(call: CallbackQuery) -> None:
     await call.answer()
@@ -719,14 +744,28 @@ async def finish_form(message: Message, state: FSMContext, user, bot: Bot) -> No
         reply_markup=main_menu(user.id),
     )
     if is_new:
-        count = len(all_participants())
-        for admin_id in ADMIN_IDS - {user.id}:
-            await send_safe(
-                bot, admin_id,
-                f"🔔 Новый участник: <b>{escape(p['name'])}</b>"
-                + (" ✈️" if p["location"] == LOC_AWAY else "")
-                + f"\nВсего: <b>{count}</b>",
-            )
+        # Рассылаем в фоне, чтобы новичок не ждал, пока пуш дойдёт до всех
+        task = asyncio.create_task(announce_newcomer(bot, user.id, p["name"]))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def announce_newcomer(bot: Bot, newcomer_id: int, name: str) -> None:
+    """Пуш всем участникам и организаторам (кроме самого новичка): «В болоте пополнение!»."""
+    people = all_participants()
+    recipients = ({p["user_id"] for p in people} | ADMIN_IDS) - {newcomer_id}
+    text = (
+        "🎉 <b>В болоте пополнение!</b>\n"
+        f"{escape(name)} жабилизировался 🐸\n"
+        f"Нас уже <b>{len(people)}</b>"
+    )
+    markup = kb([("👥 Кто участвует", "people")])
+    for uid in recipients:
+        await send_safe(bot, uid, text, reply_markup=markup)
+        await asyncio.sleep(0.05)
 
 
 @router.message(Form.not_wish, F.text)
@@ -964,21 +1003,10 @@ async def admin_set_date(message: Message, state: FSMContext) -> None:
 @admin_router.callback_query(F.data == "admin_list")
 async def cb_admin_list(call: CallbackQuery) -> None:
     await call.answer()
-    people = all_participants()
-    if people:
-        # Только имена и ✈️ — пожелания и адреса организатор не видит
-        lines = [
-            f"{i}. {escape(p['name'])}"
-            + (f" (@{escape(p['username'])})" if p["username"] else "")
-            + (" ✈️" if p["location"] == LOC_AWAY else "")
-            for i, p in enumerate(people, 1)
-        ]
-        text = f"👥 <b>Участники ({len(people)}):</b>\n\n" + "\n".join(lines)
-        if any(p["location"] == LOC_AWAY for p in people):
-            text += "\n\n✈️ — не будет на празднике, нужна доставка"
-    else:
-        text = "Пока никто не записался 🐸"
-    await call.message.edit_text(text, reply_markup=kb([("⬅️ Назад", "admin")]))
+    await call.message.edit_text(
+        participants_list_text(with_usernames=True),
+        reply_markup=kb([("⬅️ Назад", "admin")]),
+    )
 
 
 
