@@ -397,21 +397,20 @@ def draw_text(r: sqlite3.Row) -> str:
     )
 
 
-def participants_list_text(with_usernames: bool) -> str:
-    """Список участников: только имена и ✈️ — без пожеланий и адресов.
-    @username показываем только организатору."""
+def participants_list_text(for_admin: bool) -> str:
+    """Список участников: имя, @тег и ✈️ — без пожеланий и адресов."""
     people = all_participants()
     if not people:
         return "Пока никто не записался 🐸"
     lines = [
         f"{i}. {escape(p['name'])}"
-        + (f" (@{escape(p['username'])})" if with_usernames and p["username"] else "")
+        + (f" (@{escape(p['username'])})" if p["username"] else "")
         + (" ✈️" if p["location"] == LOC_AWAY else "")
         for i, p in enumerate(people, 1)
     ]
     text = f"👥 <b>Участники ({len(people)}):</b>\n\n" + "\n".join(lines)
     if any(p["location"] == LOC_AWAY for p in people):
-        text += "\n\n✈️ — не будет на празднике" + (", нужна доставка" if with_usernames else "")
+        text += "\n\n✈️ — не будет на празднике" + (", нужна доставка" if for_admin else "")
     return text
 
 
@@ -601,7 +600,7 @@ async def cb_menu(call: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "people")
 async def cb_people(call: CallbackQuery) -> None:
     await call.answer()
-    await call.message.edit_text(participants_list_text(with_usernames=False), reply_markup=BACK_KB)
+    await call.message.edit_text(participants_list_text(for_admin=False), reply_markup=BACK_KB)
 
 
 @router.callback_query(F.data == "rules")
@@ -1004,7 +1003,7 @@ async def admin_set_date(message: Message, state: FSMContext) -> None:
 async def cb_admin_list(call: CallbackQuery) -> None:
     await call.answer()
     await call.message.edit_text(
-        participants_list_text(with_usernames=True),
+        participants_list_text(for_admin=True),
         reply_markup=kb([("⬅️ Назад", "admin")]),
     )
 
