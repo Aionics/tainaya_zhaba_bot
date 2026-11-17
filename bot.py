@@ -178,6 +178,29 @@ def clear_pairs() -> None:
         conn.execute("DELETE FROM pairs")
 
 
+EDITABLE_FIELDS = {"name", "wish", "not_wish", "location", "delivery"}
+
+
+def update_participant(user_id: int, **fields) -> None:
+    """Точечно меняет поля анкеты (только из белого списка)."""
+    assert fields and set(fields) <= EDITABLE_FIELDS
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with db() as conn:
+        conn.execute(
+            f"UPDATE participants SET {cols} WHERE user_id = ?",
+            (*fields.values(), user_id),
+        )
+
+
+def refresh_username(user_id: int, username: str | None) -> None:
+    """Обновляет @тег участника, если он поменял его в Telegram."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE participants SET username = ? WHERE user_id = ? AND username IS NOT ?",
+            (username, user_id, username),
+        )
+
+
 def get_receiver(santa_id: int) -> sqlite3.Row | None:
     """Кому дарит этот Санта."""
     with db() as conn:
@@ -356,11 +379,15 @@ def rules_text() -> str:
     )
 
 
+def name_with_tag(p: sqlite3.Row) -> str:
+    """«Имя (@тег)» — как в списке участников; без тега — просто имя."""
+    return escape(p["name"]) + (f" (@{escape(p['username'])})" if p["username"] else "")
+
+
 def profile_text(p: sqlite3.Row, for_santa: bool = False) -> str:
-    lines = [
-        f"👤 <b>Имя:</b> {escape(p['name'])}",
-        f"🎁 <b>Хочет получить:</b> {escape(p['wish'])}",
-    ]
+    name = name_with_tag(p) if for_santa else escape(p["name"])
+    lines = [f"👤 <b>Имя:</b> {name}"]
+    lines.append(f"🎁 <b>Хочет получить:</b> {escape(p['wish'])}")
     if p["not_wish"]:
         lines.append(f"🚫 <b>Точно НЕ дарить:</b> {escape(p['not_wish'])}")
     if p["location"] == LOC_AWAY:
@@ -403,8 +430,7 @@ def participants_list_text(for_admin: bool) -> str:
     if not people:
         return "Пока никто не записался 🐸"
     lines = [
-        f"{i}. {escape(p['name'])}"
-        + (f" (@{escape(p['username'])})" if p["username"] else "")
+        f"{i}. {name_with_tag(p)}"
         + (" ✈️" if p["location"] == LOC_AWAY else "")
         for i, p in enumerate(people, 1)
     ]
@@ -435,7 +461,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
             rows.append([("📝 Моя анкета", "my_profile")])
     elif p:
         rows.append([("📝 Моя анкета", "my_profile")])
-        rows.append([("✏️ Изменить анкету", "join")])
+        rows.append([("✏️ Изменить анкету", "edit")])
         rows.append([("🚪 Выйти из игры", "leave")])
     else:
         rows.append([("🐸 Участвую!", "join")])
@@ -487,6 +513,15 @@ class Form(StatesGroup):
     location = State()
     delivery = State()
     not_wish = State()
+
+
+class Edit(StatesGroup):
+    name = State()
+    wish = State()
+    not_wish = State()
+    location = State()
+    delivery = State()
+    confirm = State()   # показали «было → стало», ждём ✅ / ❌
 
 
 class Ask(StatesGroup):
@@ -625,6 +660,9 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_join(call: CallbackQuery, state: FSMContext) -> None:
     if draw_done():
         await call.answer("Жеребьёвка уже прошла, запись закрыта 🐸", show_alert=True)
+        return
+    if get_participant(call.from_user.id):
+        await cb_edit(call, state)  # старая кнопка «Изменить анкету» → меню правок
         return
     await call.answer()
     await state.clear()
@@ -785,6 +823,219 @@ async def skip_not_wish(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
 @router.message(StateFilter(Form))
 async def form_not_text(message: Message) -> None:
     await message.answer("Пришли, пожалуйста, текстом 🐸")
+
+
+# ───────────────────────── Правка анкеты по полям ─────────────────────────
+
+EDIT_MENU_KB = kb(
+    [("👤 Изменить имя", "edit_name")],
+    [("🎁 Изменить, что хочу", "edit_wish")],
+    [("📍 Изменить способ получения", "edit_location")],
+    [("🚫 Изменить «что не дарить»", "edit_not_wish")],
+    [("⬅️ В меню", "menu")],
+)
+EDIT_CANCEL_KB = kb([("❌ Отмена", "edit")])
+EDIT_LOCATION_KB = kb(
+    [("🎄 На празднике с нашими — получу лично", "edit_loc_party")],
+    [("✈️ В другом месте — нужна доставка", "edit_loc_away")],
+    [("❌ Отмена", "edit")],
+)
+EDIT_NOT_WISH_KB = kb(
+    [("🗑 Убрать — дарите что угодно", "edit_not_wish_clear")],
+    [("❌ Отмена", "edit")],
+)
+CONFIRM_KB = kb([("✅ Сохранить", "edit_save"), ("❌ Отмена", "edit")])
+
+FIELD_TITLES = {
+    "name": "👤 Имя",
+    "wish": "🎁 Что хочешь получить",
+    "not_wish": "🚫 Что точно НЕ дарить",
+    "location": "📍 Способ получения",
+}
+
+
+def field_view(field: str, values: dict) -> str:
+    if field == "location":
+        if values.get("location") == LOC_AWAY:
+            d = values.get("delivery")
+            return "✈️ доставка" + (f": {escape(d)}" if d else "")
+        return "🎄 лично на празднике"
+    v = values.get(field)
+    return escape(v) if v else "<i>не указано</i>"
+
+
+async def edit_allowed(call: CallbackQuery, state: FSMContext) -> sqlite3.Row | None:
+    """Анкету можно править, пока не было жеребьёвки и человек записан."""
+    if draw_done():
+        await state.clear()
+        await call.answer("Жеребьёвка уже прошла — анкету не поменять 🐸", show_alert=True)
+        return None
+    p = get_participant(call.from_user.id)
+    if not p:
+        await state.clear()
+        await call.answer("Ты ещё не записан 🐸", show_alert=True)
+        return None
+    return p
+
+
+@router.callback_query(F.data == "edit")
+async def cb_edit(call: CallbackQuery, state: FSMContext) -> None:
+    p = await edit_allowed(call, state)
+    if not p:
+        return
+    await call.answer()
+    await state.clear()
+    await call.message.edit_text(
+        f"✏️ <b>Что поменять в анкете?</b>\n\n{profile_text(p)}",
+        reply_markup=EDIT_MENU_KB,
+    )
+
+
+async def start_edit(call: CallbackQuery, state: FSMContext, st: State, question: str, markup) -> None:
+    if not await edit_allowed(call, state):
+        return
+    await call.answer()
+    await state.clear()
+    await state.set_state(st)
+    await call.message.edit_text(question, reply_markup=markup)
+
+
+@router.callback_query(F.data == "edit_name")
+async def cb_edit_name(call: CallbackQuery, state: FSMContext) -> None:
+    await start_edit(call, state, Edit.name,
+                     "👤 <b>Напиши новое имя</b>\n<i>Это имя увидит твой Тайный Санта.</i>",
+                     EDIT_CANCEL_KB)
+
+
+@router.callback_query(F.data == "edit_wish")
+async def cb_edit_wish(call: CallbackQuery, state: FSMContext) -> None:
+    await start_edit(call, state, Edit.wish,
+                     "🎁 <b>Что бы тебе хотелось получить?</b>\n"
+                     "<i>Напиши заново — новый текст заменит старый.</i>",
+                     EDIT_CANCEL_KB)
+
+
+@router.callback_query(F.data == "edit_not_wish")
+async def cb_edit_not_wish(call: CallbackQuery, state: FSMContext) -> None:
+    await start_edit(call, state, Edit.not_wish,
+                     "🚫 <b>Чего точно НЕ дарить?</b>\n"
+                     "<i>Напиши заново или убери этот пункт совсем.</i>",
+                     EDIT_NOT_WISH_KB)
+
+
+@router.callback_query(F.data == "edit_location")
+async def cb_edit_location(call: CallbackQuery, state: FSMContext) -> None:
+    await start_edit(call, state, Edit.location,
+                     "📍 <b>Где будешь встречать Новый год?</b>", EDIT_LOCATION_KB)
+
+
+async def ask_confirm(message: Message, state: FSMContext, user_id: int, field: str, new: dict) -> None:
+    """Показать «было → стало» и ждать подтверждения."""
+    p = get_participant(user_id)
+    old = dict(p) if p else {}
+    await state.set_state(Edit.confirm)
+    await state.update_data(new=new)
+    await message.answer(
+        f"{FIELD_TITLES[field]}\n\n"
+        f"<b>Было:</b> {field_view(field, old)}\n"
+        f"<b>Стало:</b> {field_view(field, new)}\n\n"
+        "Сохранить?",
+        reply_markup=CONFIRM_KB,
+    )
+
+
+@router.message(Edit.name, F.text)
+async def edit_name(message: Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    if not name or len(name) > NAME_MAX:
+        await message.answer(f"Имя должно быть от 1 до {NAME_MAX} символов 🐸", reply_markup=EDIT_CANCEL_KB)
+        return
+    await ask_confirm(message, state, message.from_user.id, "name", {"name": name})
+
+
+@router.message(Edit.wish, F.text)
+async def edit_wish(message: Message, state: FSMContext) -> None:
+    wish = message.text.strip()
+    if not wish or len(wish) > TEXT_MAX:
+        await message.answer(f"Напиши хоть что-нибудь, но не длиннее {TEXT_MAX} символов 🐸",
+                             reply_markup=EDIT_CANCEL_KB)
+        return
+    await ask_confirm(message, state, message.from_user.id, "wish", {"wish": wish})
+
+
+@router.message(Edit.not_wish, F.text)
+async def edit_not_wish(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()[:TEXT_MAX] or None
+    await ask_confirm(message, state, message.from_user.id, "not_wish", {"not_wish": text})
+
+
+@router.callback_query(Edit.not_wish, F.data == "edit_not_wish_clear")
+async def cb_edit_not_wish_clear(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await ask_confirm(call.message, state, call.from_user.id, "not_wish", {"not_wish": None})
+
+
+@router.callback_query(Edit.location, F.data == "edit_loc_party")
+async def cb_edit_loc_party(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await ask_confirm(call.message, state, call.from_user.id, "location",
+                      {"location": LOC_PARTY, "delivery": None})
+
+
+@router.callback_query(Edit.location, F.data == "edit_loc_away")
+async def cb_edit_loc_away(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(Edit.delivery)
+    await call.message.edit_text(
+        "✈️ <b>Как тебе удобнее получить подарок?</b>\n"
+        "<i>Напиши страну, город и способ: адрес, пункт выдачи, маркетплейс "
+        "или электронный подарок (сертификат, подписка). "
+        "Это увидит только твой Тайный Санта.</i>",
+        reply_markup=EDIT_CANCEL_KB,
+    )
+
+
+@router.message(Edit.location)
+async def edit_location_text(message: Message) -> None:
+    await message.answer("Выбери, пожалуйста, кнопкой 👇", reply_markup=EDIT_LOCATION_KB)
+
+
+@router.message(Edit.delivery, F.text)
+async def edit_delivery(message: Message, state: FSMContext) -> None:
+    delivery = message.text.strip()
+    if not delivery or len(delivery) > TEXT_MAX:
+        await message.answer(f"Напиши, как тебе отправить подарок (до {TEXT_MAX} символов) 🐸",
+                             reply_markup=EDIT_CANCEL_KB)
+        return
+    await ask_confirm(message, state, message.from_user.id, "location",
+                      {"location": LOC_AWAY, "delivery": delivery})
+
+
+@router.callback_query(Edit.confirm, F.data == "edit_save")
+async def cb_edit_save(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not await edit_allowed(call, state):
+        return
+    await call.answer("Сохранено ✅")
+    update_participant(call.from_user.id, **data["new"])
+    await state.clear()
+    await call.message.edit_text(
+        "✅ <b>Сохранено!</b> Что-нибудь ещё поменять?\n\n"
+        f"{profile_text(get_participant(call.from_user.id))}",
+        reply_markup=EDIT_MENU_KB,
+    )
+
+
+@router.message(Edit.confirm)
+async def edit_confirm_text(message: Message) -> None:
+    await message.answer("Нажми «✅ Сохранить» или «❌ Отмена» 👇", reply_markup=CONFIRM_KB)
+
+
+@router.message(StateFilter(Edit))
+async def edit_not_text(message: Message) -> None:
+    await message.answer("Пришли, пожалуйста, текстом 🐸", reply_markup=EDIT_CANCEL_KB)
 
 
 # ───────────────────────── Профиль и подопечный ─────────────────────────
@@ -1221,6 +1472,23 @@ async def reminder_loop(bot: Bot) -> None:
 
 # ───────────────────────── Запуск ─────────────────────────
 
+async def username_middleware(handler, event, data):
+    """При любом сообщении/нажатии освежаем @тег — он нужен Санте в ссылке на профиль."""
+    user = getattr(event, "from_user", None)
+    if user and not user.is_bot:
+        refresh_username(user.id, user.username)
+    return await handler(event, data)
+
+
+def make_dispatcher() -> Dispatcher:
+    dp = Dispatcher(storage=SQLiteStorage())
+    dp.message.outer_middleware(username_middleware)
+    dp.callback_query.outer_middleware(username_middleware)
+    # Порядок важен: сначала организатор, потом группа, потом все остальные
+    dp.include_routers(admin_router, group_router, router)
+    return dp
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     if not BOT_TOKEN:
@@ -1230,9 +1498,7 @@ async def main() -> None:
 
     init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=SQLiteStorage())
-    # Порядок важен: сначала организатор, потом группа, потом все остальные
-    dp.include_routers(admin_router, group_router, router)
+    dp = make_dispatcher()
     # Команды в синей кнопке «Меню» Telegram
     await bot.set_my_commands(
         [
