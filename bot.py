@@ -26,6 +26,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -47,6 +48,8 @@ MIN_PARTICIPANTS = 3
 # Лимиты длины ответов
 NAME_MAX = 50
 TEXT_MAX = 500
+MAX_PHOTOS = 10      # столько фото помещается в один альбом Telegram
+ALBUM_WAIT = 1.0     # сек: ждём, пока долетят все фото альбома
 
 LOC_PARTY = "party"  # будет на празднике, получит лично
 LOC_AWAY = "away"    # в другом месте, нужна доставка
@@ -82,7 +85,8 @@ def init_db() -> None:
                 wish      TEXT NOT NULL,
                 not_wish  TEXT,
                 location  TEXT NOT NULL DEFAULT 'party',
-                delivery  TEXT
+                delivery  TEXT,
+                wish_photos TEXT
             );
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -100,6 +104,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE participants ADD COLUMN location TEXT NOT NULL DEFAULT 'party'")
         if "delivery" not in cols:
             conn.execute("ALTER TABLE participants ADD COLUMN delivery TEXT")
+        if "wish_photos" not in cols:
+            conn.execute("ALTER TABLE participants ADD COLUMN wish_photos TEXT")
 
 
 def get_setting(key: str) -> str | None:
@@ -133,15 +139,16 @@ def save_participant(user_id: int, username: str | None, data: dict) -> None:
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO participants (user_id, username, name, wish, not_wish, location, delivery)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO participants (user_id, username, name, wish, not_wish, location, delivery, wish_photos)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username,
                 name     = excluded.name,
                 wish     = excluded.wish,
                 not_wish = excluded.not_wish,
                 location = excluded.location,
-                delivery = excluded.delivery
+                delivery = excluded.delivery,
+                wish_photos = excluded.wish_photos
             """,
             (
                 user_id,
@@ -151,6 +158,7 @@ def save_participant(user_id: int, username: str | None, data: dict) -> None:
                 data.get("not_wish"),
                 data.get("location", LOC_PARTY),
                 data.get("delivery"),
+                data.get("wish_photos"),
             ),
         )
 
@@ -178,7 +186,7 @@ def clear_pairs() -> None:
         conn.execute("DELETE FROM pairs")
 
 
-EDITABLE_FIELDS = {"name", "wish", "not_wish", "location", "delivery"}
+EDITABLE_FIELDS = {"name", "wish", "wish_photos", "not_wish", "location", "delivery"}
 
 
 def update_participant(user_id: int, **fields) -> None:
@@ -384,10 +392,23 @@ def name_with_tag(p: sqlite3.Row) -> str:
     return escape(p["name"]) + (f" (@{escape(p['username'])})" if p["username"] else "")
 
 
+def photos_of(raw: str | None) -> list[str]:
+    """file_id фото к пожеланию (в базе — JSON-список)."""
+    return json.loads(raw) if raw else []
+
+
+def wish_view(wish: str | None, photos_raw: str | None) -> str:
+    n = len(photos_of(photos_raw))
+    text = escape(wish) if wish else ""
+    if n:
+        text += (" " if text else "") + f"🖼 <i>+ {n} фото</i>"
+    return text or "<i>не указано</i>"
+
+
 def profile_text(p: sqlite3.Row, for_santa: bool = False) -> str:
     name = name_with_tag(p) if for_santa else escape(p["name"])
     lines = [f"👤 <b>Имя:</b> {name}"]
-    lines.append(f"🎁 <b>Хочет получить:</b> {escape(p['wish'])}")
+    lines.append(f"🎁 <b>Хочет получить:</b> {wish_view(p['wish'], p['wish_photos'])}")
     if p["not_wish"]:
         lines.append(f"🚫 <b>Точно НЕ дарить:</b> {escape(p['not_wish'])}")
     if p["location"] == LOC_AWAY:
@@ -547,6 +568,51 @@ async def ask_below(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup
     await call.message.answer(text, reply_markup=markup)
 
 
+async def collect_album(message: Message) -> list[Message] | None:
+    """
+    Telegram присылает альбом отдельными сообщениями. Первое сообщение ждёт
+    остальные и возвращает весь альбом, остальные возвращают None (их уже учли).
+    """
+    if not message.media_group_id:
+        return [message]
+    key = f"{message.chat.id}:{message.media_group_id}"
+    if key in _albums:
+        _albums[key].append(message)
+        return None
+    _albums[key] = [message]
+    await asyncio.sleep(ALBUM_WAIT)
+    return _albums.pop(key)
+
+
+_albums: dict[str, list[Message]] = {}
+
+
+def text_and_photos(messages: list[Message]) -> tuple[str, list[str]]:
+    """Текст (или подпись к фото) и file_id фото — берём самое большое разрешение."""
+    text = next((m.text or m.caption for m in messages if m.text or m.caption), "") or ""
+    photos = [m.photo[-1].file_id for m in messages if m.photo][:MAX_PHOTOS]
+    return text.strip(), photos
+
+
+async def send_with_photos(bot: Bot, chat_id: int, text: str, photos: list[str], **kwargs) -> bool:
+    """Текст + фото. Текст с кнопками всегда последним — внизу чата."""
+    try:
+        if not photos:
+            await bot.send_message(chat_id, text, **kwargs)
+        elif len(photos) == 1 and len(text) <= 1024:
+            await bot.send_photo(chat_id, photos[0], caption=text, **kwargs)
+        else:
+            if len(photos) == 1:
+                await bot.send_photo(chat_id, photos[0])
+            else:
+                await bot.send_media_group(chat_id, [InputMediaPhoto(media=f) for f in photos])
+            await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except Exception:
+        logging.exception("Не удалось отправить сообщение %s", chat_id)
+        return False
+
+
 async def send_safe(bot: Bot, user_id: int, text: str, **kwargs) -> bool:
     """Отправить сообщение, не падая, если человек заблокировал бота."""
     try:
@@ -615,8 +681,8 @@ async def cmd_my(message: Message, state: FSMContext) -> None:
             reply_markup=main_menu(message.from_user.id),
         )
         return
-    await message.answer(
-        receiver_text(r),
+    await send_with_photos(
+        message.bot, message.chat.id, receiver_text(r), photos_of(r["wish_photos"]),
         reply_markup=kb([("❓ Спросить анонимно", "ask")], [("⬅️ В меню", "menu")]),
     )
 
@@ -690,18 +756,40 @@ async def form_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         "📝 <b>Анкета участника</b> (2/4)\n\n"
         "🎁 <b>Что бы тебе хотелось получить?</b>\n"
-        "<i>Можно несколько идей или общее направление.</i>",
+        f"{WISH_HINT}",
         reply_markup=CANCEL_KB,
     )
 
 
-@router.message(Form.wish, F.text)
+WISH_HINT = (
+    "<i>Можно несколько идей или общее направление.\n"
+    f"🖼 Можно приложить фото (до {MAX_PHOTOS}) — картинку с маркетплейса или скриншот. "
+    "Текст тогда пиши в подписи к фото.</i>"
+)
+
+
+async def read_wish(message: Message, markup=None) -> tuple[str, list[str]] | None:
+    """Пожелание: текст и/или фото. None — если это хвост альбома или ошибка ввода."""
+    album = await collect_album(message)
+    if album is None:
+        return None
+    wish, photos = text_and_photos(album)
+    if (not wish and not photos) or len(wish) > TEXT_MAX:
+        await message.answer(
+            f"Напиши хоть что-нибудь или пришли фото (текст — не длиннее {TEXT_MAX} символов) 🐸",
+            reply_markup=markup,
+        )
+        return None
+    return wish, photos
+
+
+@router.message(Form.wish, F.text | F.photo)
 async def form_wish(message: Message, state: FSMContext) -> None:
-    wish = message.text.strip()
-    if not wish or len(wish) > TEXT_MAX:
-        await message.answer(f"Напиши хоть что-нибудь, но не длиннее {TEXT_MAX} символов 🐸")
+    got = await read_wish(message)
+    if not got:
         return
-    await state.update_data(wish=wish)
+    wish, photos = got
+    await state.update_data(wish=wish, wish_photos=json.dumps(photos) if photos else None)
     await state.set_state(Form.location)
     await message.answer(
         "📝 <b>Анкета участника</b> (3/4)\n\n"
@@ -860,6 +948,8 @@ def field_view(field: str, values: dict) -> str:
             d = values.get("delivery")
             return "✈️ доставка" + (f": {escape(d)}" if d else "")
         return "🎄 лично на празднике"
+    if field == "wish":
+        return wish_view(values.get("wish"), values.get("wish_photos"))
     v = values.get(field)
     return escape(v) if v else "<i>не указано</i>"
 
@@ -911,7 +1001,8 @@ async def cb_edit_name(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_edit_wish(call: CallbackQuery, state: FSMContext) -> None:
     await start_edit(call, state, Edit.wish,
                      "🎁 <b>Что бы тебе хотелось получить?</b>\n"
-                     "<i>Напиши заново — новый текст заменит старый.</i>",
+                     "<i>Напиши заново — новое пожелание (текст и фото) заменит старое.</i>\n\n"
+                     f"{WISH_HINT}",
                      EDIT_CANCEL_KB)
 
 
@@ -953,14 +1044,14 @@ async def edit_name(message: Message, state: FSMContext) -> None:
     await ask_confirm(message, state, message.from_user.id, "name", {"name": name})
 
 
-@router.message(Edit.wish, F.text)
+@router.message(Edit.wish, F.text | F.photo)
 async def edit_wish(message: Message, state: FSMContext) -> None:
-    wish = message.text.strip()
-    if not wish or len(wish) > TEXT_MAX:
-        await message.answer(f"Напиши хоть что-нибудь, но не длиннее {TEXT_MAX} символов 🐸",
-                             reply_markup=EDIT_CANCEL_KB)
+    got = await read_wish(message, EDIT_CANCEL_KB)
+    if not got:
         return
-    await ask_confirm(message, state, message.from_user.id, "wish", {"wish": wish})
+    wish, photos = got
+    await ask_confirm(message, state, message.from_user.id, "wish",
+                      {"wish": wish, "wish_photos": json.dumps(photos) if photos else None})
 
 
 @router.message(Edit.not_wish, F.text)
@@ -1045,7 +1136,12 @@ async def cb_my_profile(call: CallbackQuery) -> None:
     await call.answer()
     p = get_participant(call.from_user.id)
     text = f"📝 <b>Твоя анкета</b>\n\n{profile_text(p)}" if p else "Ты ещё не записан 🐸"
-    await call.message.edit_text(text, reply_markup=BACK_KB)
+    photos = photos_of(p["wish_photos"]) if p else []
+    if photos:
+        await call.message.edit_reply_markup(reply_markup=None)
+        await send_with_photos(call.bot, call.from_user.id, text, photos, reply_markup=BACK_KB)
+    else:
+        await call.message.edit_text(text, reply_markup=BACK_KB)
 
 
 
@@ -1078,10 +1174,13 @@ async def cb_my_receiver(call: CallbackQuery) -> None:
     if not r:
         await call.answer("Жеребьёвки ещё не было 🐸", show_alert=True)
         return
-    await call.message.edit_text(
-        receiver_text(r),
-        reply_markup=kb([("❓ Спросить анонимно", "ask")], [("⬅️ Назад", "menu")]),
-    )
+    markup = kb([("❓ Спросить анонимно", "ask")], [("⬅️ Назад", "menu")])
+    photos = photos_of(r["wish_photos"])
+    if photos:
+        await call.message.edit_reply_markup(reply_markup=None)
+        await send_with_photos(call.bot, call.from_user.id, receiver_text(r), photos, reply_markup=markup)
+    else:
+        await call.message.edit_text(receiver_text(r), reply_markup=markup)
     await call.answer()
 
 
@@ -1096,23 +1195,43 @@ async def cb_ask(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(Ask.question)
     await call.message.answer(
         f"❓ <b>Вопрос для {escape(r['name'])}</b>\n"
-        "<i>Напиши вопрос — я перешлю его без твоего имени.</i>",
+        "<i>Напиши вопрос — я перешлю его без твоего имени. Можно приложить фото 🖼</i>",
         reply_markup=CANCEL_KB,
     )
     await call.answer()
 
 
-@router.message(Ask.question, F.text)
+async def read_anon(message: Message) -> tuple[str, list[str]] | None:
+    album = await collect_album(message)
+    if album is None:
+        return None
+    text, photos = text_and_photos(album)
+    if not text and not photos:
+        return None
+    return text[:TEXT_MAX], photos
+
+
+def anon_text(head: str, text: str, photos: list[str]) -> str:
+    """«Санта спрашивает: «…»» — или просто «прислал фото», если текста нет."""
+    if text:
+        return f"{head}\n\n«{escape(text)}»"
+    return f"{head}\n\n🖼 <i>фото</i>"
+
+
+@router.message(Ask.question, F.text | F.photo)
 async def ask_question(message: Message, state: FSMContext, bot: Bot) -> None:
+    got = await read_anon(message)
+    if not got:
+        return
+    text, photos = got
     await state.clear()
     r = get_receiver(message.from_user.id)
     if not r:
         await message.answer("Жеребьёвка была сброшена — вопрос не отправлен 🐸")
         return
-    ok = await send_safe(
+    ok = await send_with_photos(
         bot, r["user_id"],
-        "🎅 <b>Твой Тайный Санта спрашивает:</b>\n\n"
-        f"«{escape(message.text.strip()[:TEXT_MAX])}»",
+        anon_text("🎅 <b>Твой Тайный Санта спрашивает:</b>", text, photos), photos,
         reply_markup=kb([("✉️ Ответить Санте", "reply_santa")]),
     )
     await message.answer(
@@ -1129,23 +1248,26 @@ async def cb_reply_santa(call: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(Ask.answer)
     await call.message.answer(
-        "✉️ <b>Ответ Санте</b>\n<i>Напиши ответ — я передам его твоему Санте.</i>",
+        "✉️ <b>Ответ Санте</b>\n<i>Напиши ответ — я передам его твоему Санте. Можно приложить фото 🖼</i>",
         reply_markup=CANCEL_KB,
     )
     await call.answer()
 
 
-@router.message(Ask.answer, F.text)
+@router.message(Ask.answer, F.text | F.photo)
 async def ask_answer(message: Message, state: FSMContext, bot: Bot) -> None:
+    got = await read_anon(message)
+    if not got:
+        return
+    text, photos = got
     await state.clear()
     santa_id = get_santa_id(message.from_user.id)
     if not santa_id:
         await message.answer("Жеребьёвка была сброшена — ответ не отправлен 🐸")
         return
-    ok = await send_safe(
+    ok = await send_with_photos(
         bot, santa_id,
-        "📩 <b>Подопечный ответил:</b>\n\n"
-        f"«{escape(message.text.strip()[:TEXT_MAX])}»",
+        anon_text("📩 <b>Подопечный ответил:</b>", text, photos), photos,
         reply_markup=kb([("❓ Спросить ещё", "ask")]),
     )
     await message.answer(
@@ -1156,7 +1278,7 @@ async def ask_answer(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.message(StateFilter(Ask))
 async def ask_not_text(message: Message) -> None:
-    await message.answer("Пришли, пожалуйста, текстом 🐸")
+    await message.answer("Пришли, пожалуйста, текст или фото 🐸")
 
 
 # ───────────────────────── Организатор ─────────────────────────
@@ -1324,10 +1446,11 @@ async def cb_admin_draw_yes(call: CallbackQuery, bot: Bot) -> None:
 
     failed = []
     for santa_id, receiver_id in pairs:
-        ok = await send_safe(
+        ok = await send_with_photos(
             bot, santa_id,
             draw_text(people[receiver_id])
             + f"\n\n👇 Подопечного всегда можно посмотреть кнопкой «{WARD_BTN}» внизу",
+            photos_of(people[receiver_id]["wish_photos"]),
             reply_markup=WARD_KB,
         )
         if not ok:
