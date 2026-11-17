@@ -768,14 +768,12 @@ WISH_HINT = (
 )
 
 
-async def read_wish(message: Message, markup=None, strip_mention: bool = False) -> tuple[str, list[str]] | None:
+async def read_wish(message: Message, markup=None) -> tuple[str, list[str]] | None:
     """Пожелание: текст и/или фото. None — если это хвост альбома или ошибка ввода."""
     album = await collect_album(message)
     if album is None:
         return None
     wish, photos = text_and_photos(album)
-    if strip_mention:
-        wish = await strip_bot_mention(message.bot, wish)
     if (not wish and not photos) or len(wish) > TEXT_MAX:
         await message.answer(
             f"Напиши хоть что-нибудь или пришли фото (текст — не длиннее {TEXT_MAX} символов) 🐸",
@@ -930,6 +928,10 @@ EDIT_LOCATION_KB = kb(
     [("✈️ В другом месте — нужна доставка", "edit_loc_away")],
     [("❌ Отмена", "edit")],
 )
+EDIT_NOT_WISH_KB = kb(
+    [("🗑 Убрать — дарите что угодно", "edit_not_wish_clear")],
+    [("❌ Отмена", "edit")],
+)
 CONFIRM_KB = kb([("✅ Сохранить", "edit_save"), ("❌ Отмена", "edit")])
 
 FIELD_TITLES = {
@@ -979,104 +981,43 @@ async def cb_edit(call: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-# Кнопка «вставить текущий текст» кладёт его прямо в поле ввода (через
-# switch_inline_query_current_chat). Telegram ставит перед ним «@имя_бота » —
-# эту приставку бот срезает при получении. Длинные тексты в кнопку не влезают.
-PREFILL_MAX = 256
-
-
-def prefill_kb(current: str | None, *rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    buttons = []
-    if current and len(current) <= PREFILL_MAX:
-        buttons.append([InlineKeyboardButton(
-            text="✏️ Вставить текущий текст", switch_inline_query_current_chat=current
-        )])
-    buttons += [[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def current_block(current: str | None) -> str:
-    """Показать текущее значение, чтобы его можно было дописать, а не набирать заново."""
-    if not current:
-        return ""
-    how = (
-        "Нажми «✏️ Вставить текущий текст» — он появится в поле ввода, допиши и отправь. "
-        if len(current) <= PREFILL_MAX else ""
-    )
-    return (
-        f"\n\n<b>Сейчас:</b>\n<code>{escape(current)}</code>\n"
-        f"<i>{how}Или нажми на текст выше — он скопируется.</i>"
-    )
-
-
-async def strip_bot_mention(bot: Bot, text: str) -> str:
-    """Срезать «@имя_бота » в начале — её добавляет кнопка «Вставить текущий текст»."""
-    me = await bot.me()
-    prefix = f"@{me.username}".lower()
-    if text.lower().startswith(prefix):
-        text = text[len(prefix):]
-    return text.strip()
-
-
-async def start_edit(call: CallbackQuery, state: FSMContext, st: State) -> sqlite3.Row | None:
-    p = await edit_allowed(call, state)
-    if not p:
-        return None
+async def start_edit(call: CallbackQuery, state: FSMContext, st: State, question: str, markup) -> None:
+    if not await edit_allowed(call, state):
+        return
     await call.answer()
     await state.clear()
     await state.set_state(st)
-    return p
+    await call.message.edit_text(question, reply_markup=markup)
 
 
 @router.callback_query(F.data == "edit_name")
 async def cb_edit_name(call: CallbackQuery, state: FSMContext) -> None:
-    if not (p := await start_edit(call, state, Edit.name)):
-        return
-    await call.message.edit_text(
-        "👤 <b>Напиши новое имя</b>\n<i>Это имя увидит твой Тайный Санта.</i>"
-        + current_block(p["name"]),
-        reply_markup=prefill_kb(p["name"], [("❌ Отмена", "edit")]),
-    )
+    await start_edit(call, state, Edit.name,
+                     "👤 <b>Напиши новое имя</b>\n<i>Это имя увидит твой Тайный Санта.</i>",
+                     EDIT_CANCEL_KB)
 
 
 @router.callback_query(F.data == "edit_wish")
 async def cb_edit_wish(call: CallbackQuery, state: FSMContext) -> None:
-    if not (p := await start_edit(call, state, Edit.wish)):
-        return
-    photos_note = ""
-    if photos_of(p["wish_photos"]):
-        photos_note = "\n\n🖼 <i>Сейчас приложено фото: " + str(len(photos_of(p["wish_photos"]))) + \
-            ". Если пришлёшь только текст — фото уберутся.</i>"
-    await call.message.edit_text(
-        "🎁 <b>Что бы тебе хотелось получить?</b>\n"
-        "<i>Новое пожелание (текст и фото) заменит старое.</i>\n\n"
-        f"{WISH_HINT}"
-        + current_block(p["wish"]) + photos_note,
-        reply_markup=prefill_kb(p["wish"], [("❌ Отмена", "edit")]),
-    )
+    await start_edit(call, state, Edit.wish,
+                     "🎁 <b>Что бы тебе хотелось получить?</b>\n"
+                     "<i>Напиши заново — новое пожелание (текст и фото) заменит старое.</i>\n\n"
+                     f"{WISH_HINT}",
+                     EDIT_CANCEL_KB)
 
 
 @router.callback_query(F.data == "edit_not_wish")
 async def cb_edit_not_wish(call: CallbackQuery, state: FSMContext) -> None:
-    if not (p := await start_edit(call, state, Edit.not_wish)):
-        return
-    await call.message.edit_text(
-        "🚫 <b>Чего точно НЕ дарить?</b>\n"
-        "<i>Напиши заново или убери этот пункт совсем.</i>"
-        + current_block(p["not_wish"]),
-        reply_markup=prefill_kb(
-            p["not_wish"],
-            [("🗑 Убрать — дарите что угодно", "edit_not_wish_clear")],
-            [("❌ Отмена", "edit")],
-        ),
-    )
+    await start_edit(call, state, Edit.not_wish,
+                     "🚫 <b>Чего точно НЕ дарить?</b>\n"
+                     "<i>Напиши заново или убери этот пункт совсем.</i>",
+                     EDIT_NOT_WISH_KB)
 
 
 @router.callback_query(F.data == "edit_location")
 async def cb_edit_location(call: CallbackQuery, state: FSMContext) -> None:
-    if not await start_edit(call, state, Edit.location):
-        return
-    await call.message.edit_text("📍 <b>Где будешь встречать Новый год?</b>", reply_markup=EDIT_LOCATION_KB)
+    await start_edit(call, state, Edit.location,
+                     "📍 <b>Где будешь встречать Новый год?</b>", EDIT_LOCATION_KB)
 
 
 async def ask_confirm(message: Message, state: FSMContext, user_id: int, field: str, new: dict) -> None:
@@ -1096,7 +1037,7 @@ async def ask_confirm(message: Message, state: FSMContext, user_id: int, field: 
 
 @router.message(Edit.name, F.text)
 async def edit_name(message: Message, state: FSMContext) -> None:
-    name = await strip_bot_mention(message.bot, message.text)
+    name = message.text.strip()
     if not name or len(name) > NAME_MAX:
         await message.answer(f"Имя должно быть от 1 до {NAME_MAX} символов 🐸", reply_markup=EDIT_CANCEL_KB)
         return
@@ -1105,7 +1046,7 @@ async def edit_name(message: Message, state: FSMContext) -> None:
 
 @router.message(Edit.wish, F.text | F.photo)
 async def edit_wish(message: Message, state: FSMContext) -> None:
-    got = await read_wish(message, EDIT_CANCEL_KB, strip_mention=True)
+    got = await read_wish(message, EDIT_CANCEL_KB)
     if not got:
         return
     wish, photos = got
@@ -1115,7 +1056,7 @@ async def edit_wish(message: Message, state: FSMContext) -> None:
 
 @router.message(Edit.not_wish, F.text)
 async def edit_not_wish(message: Message, state: FSMContext) -> None:
-    text = (await strip_bot_mention(message.bot, message.text))[:TEXT_MAX] or None
+    text = message.text.strip()[:TEXT_MAX] or None
     await ask_confirm(message, state, message.from_user.id, "not_wish", {"not_wish": text})
 
 
@@ -1138,15 +1079,12 @@ async def cb_edit_loc_party(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_edit_loc_away(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     await state.set_state(Edit.delivery)
-    p = get_participant(call.from_user.id)
-    old = p["delivery"] if p else None
     await call.message.edit_text(
         "✈️ <b>Как тебе удобнее получить подарок?</b>\n"
         "<i>Напиши страну, город и способ: адрес, пункт выдачи, маркетплейс "
         "или электронный подарок (сертификат, подписка). "
-        "Это увидит только твой Тайный Санта.</i>"
-        + current_block(old),
-        reply_markup=prefill_kb(old, [("❌ Отмена", "edit")]),
+        "Это увидит только твой Тайный Санта.</i>",
+        reply_markup=EDIT_CANCEL_KB,
     )
 
 
@@ -1157,7 +1095,7 @@ async def edit_location_text(message: Message) -> None:
 
 @router.message(Edit.delivery, F.text)
 async def edit_delivery(message: Message, state: FSMContext) -> None:
-    delivery = await strip_bot_mention(message.bot, message.text)
+    delivery = message.text.strip()
     if not delivery or len(delivery) > TEXT_MAX:
         await message.answer(f"Напиши, как тебе отправить подарок (до {TEXT_MAX} символов) 🐸",
                              reply_markup=EDIT_CANCEL_KB)
